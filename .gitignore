@@ -1,0 +1,9 @@
+﻿# Données sources (confidentielles)
+data/inputs/
+
+# Fichiers intermédiaires
+*.parquet
+
+# Fichiers système
+.DS_Store
+Thumbs.db

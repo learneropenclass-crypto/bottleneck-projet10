@@ -1,0 +1,260 @@
+id: bottleneck_pipeline
+namespace: bottleneck
+
+description: |
+  Pipeline BottleNeck — Kestra · DuckDB · Python · Z-score
+
+triggers:
+  - id: monthly_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 15 * *"
+
+tasks:
+
+  - id: clean_erp
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    outputFiles:
+      - erp_clean.parquet
+    script: |
+      import pandas as pd
+      df = pd.read_excel('/data/inputs/erp.xlsx')
+      df = df.drop_duplicates(subset=['product_id'])
+      df.to_parquet('erp_clean.parquet', index=False)
+      print(f"ERP clean : {len(df)} lignes")
+
+  - id: test_erp
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    inputFiles:
+      erp_clean.parquet: "{{ outputs.clean_erp.outputFiles['erp_clean.parquet'] }}"
+    script: |
+      import pandas as pd
+      df = pd.read_parquet('erp_clean.parquet')
+      assert len(df) == 825, f"ERP: attendu 825 lignes, obtenu {len(df)}"
+      assert df['product_id'].duplicated().sum() == 0, "ERP: doublons détectés"
+      assert df.isnull().sum().sum() == 0, "ERP: valeurs manquantes"
+      print("✅ Test ERP OK")
+
+  - id: clean_liaison
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    outputFiles:
+      - liaison_clean.parquet
+    script: |
+      import pandas as pd
+      df = pd.read_excel('/data/inputs/liaison.xlsx')
+      df = df.dropna().drop_duplicates()
+      df['id_web'] = pd.to_numeric(df['id_web'], errors='coerce')
+      df = df.dropna(subset=['id_web'])
+      df['id_web'] = df['id_web'].astype(int)
+      df.to_parquet('liaison_clean.parquet', index=False)
+      print(f"Liaison clean : {len(df)} lignes")
+
+  - id: test_liaison
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    inputFiles:
+      liaison_clean.parquet: "{{ outputs.clean_liaison.outputFiles['liaison_clean.parquet'] }}"
+    script: |
+      import pandas as pd
+      df = pd.read_parquet('liaison_clean.parquet')
+      assert len(df) > 0, "Liaison: fichier vide"
+      assert df.isnull().sum().sum() == 0, "Liaison: nulls détectés"
+      assert df['id_web'].duplicated().sum() == 0, "Liaison: doublons sur id_web"
+      print(f"✅ Test liaison OK — {len(df)} lignes valides")
+
+  - id: clean_web
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    outputFiles:
+      - web_clean.parquet
+    script: |
+      import pandas as pd
+      df = pd.read_excel('/data/inputs/web.xlsx')
+      df = df[df['post_type'] == 'product'].drop_duplicates(subset=['sku'])
+      df['sku'] = pd.to_numeric(df['sku'], errors='coerce')
+      df = df.dropna(subset=['sku'])
+      df['sku'] = df['sku'].astype(int)
+      df[['sku','post_title','total_sales']].to_parquet('web_clean.parquet', index=False)
+      print(f"Web clean : {len(df)} lignes")
+
+  - id: test_web
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    inputFiles:
+      web_clean.parquet: "{{ outputs.clean_web.outputFiles['web_clean.parquet'] }}"
+    script: |
+      import pandas as pd
+      df = pd.read_parquet('web_clean.parquet')
+      assert len(df) > 0, "Web: fichier vide"
+      assert df['sku'].duplicated().sum() == 0, "Web: doublons sur sku"
+      print(f"✅ Test web OK — {len(df)} lignes valides")
+
+  - id: merge_data
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    inputFiles:
+      erp_clean.parquet: "{{ outputs.clean_erp.outputFiles['erp_clean.parquet'] }}"
+      liaison_clean.parquet: "{{ outputs.clean_liaison.outputFiles['liaison_clean.parquet'] }}"
+      web_clean.parquet: "{{ outputs.clean_web.outputFiles['web_clean.parquet'] }}"
+    outputFiles:
+      - merged.parquet
+    script: |
+      import duckdb
+      con = duckdb.connect()
+      con.execute("""
+          COPY (
+              SELECT e.product_id, e.price, w.post_title, w.total_sales
+              FROM 'erp_clean.parquet' e
+              INNER JOIN 'liaison_clean.parquet' l ON e.product_id = l.product_id
+              INNER JOIN 'web_clean.parquet' w ON l.id_web = w.sku
+          ) TO 'merged.parquet' (FORMAT PARQUET)
+      """)
+      count = con.execute("SELECT COUNT(*) FROM 'merged.parquet'").fetchone()[0]
+      print(f"Fusion : {count} lignes")
+
+  - id: test_merge
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    inputFiles:
+      merged.parquet: "{{ outputs.merge_data.outputFiles['merged.parquet'] }}"
+    script: |
+      import pandas as pd
+      df = pd.read_parquet('merged.parquet')
+      assert len(df) > 0, "Fusion: fichier vide"
+      assert df.isnull().sum().sum() == 0, "Fusion: nulls détectés"
+      print(f"✅ Test fusion OK — {len(df)} lignes")
+
+  - id: compute_ca
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    inputFiles:
+      merged.parquet: "{{ outputs.merge_data.outputFiles['merged.parquet'] }}"
+    outputFiles:
+      - ca.parquet
+    script: |
+      import duckdb
+      con = duckdb.connect()
+      con.execute("""
+          COPY (
+              SELECT *, ROUND(price * total_sales, 2) AS ca
+              FROM 'merged.parquet'
+          ) TO 'ca.parquet' (FORMAT PARQUET)
+      """)
+      total = con.execute("SELECT ROUND(SUM(ca),2) FROM 'ca.parquet'").fetchone()[0]
+      print(f"CA total : {total} €")
+
+  - id: test_ca
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    inputFiles:
+      ca.parquet: "{{ outputs.compute_ca.outputFiles['ca.parquet'] }}"
+    script: |
+      import pandas as pd
+      df = pd.read_parquet('ca.parquet')
+      total = df['ca'].sum()
+      assert abs(total - 70568.60) < 500, f"CA inattendu : {total:.2f} €"
+      assert (df['ca'] >= 0).all(), "CA négatif détecté"
+      print(f"✅ Test CA OK — {total:.2f} €")
+
+  - id: detect_premium
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    inputFiles:
+      ca.parquet: "{{ outputs.compute_ca.outputFiles['ca.parquet'] }}"
+    outputFiles:
+      - scored.parquet
+    script: |
+      import pandas as pd, numpy as np
+      df = pd.read_parquet('ca.parquet')
+      df['z_score'] = (df['price'] - df['price'].mean()) / df['price'].std()
+      df.to_parquet('scored.parquet', index=False)
+      print(f"Vins premium : {(df['z_score'] > 2).sum()}")
+
+  - id: test_zscore
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    inputFiles:
+      scored.parquet: "{{ outputs.detect_premium.outputFiles['scored.parquet'] }}"
+    script: |
+      import pandas as pd
+      df = pd.read_parquet('scored.parquet')
+      nb = (df['z_score'] > 2).sum()
+      assert nb == 30, f"Z-score: attendu 30, obtenu {nb}"
+      print("✅ Test z-score OK — 30 vins premium")
+
+  - id: export_rapport_ca
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    inputFiles:
+      scored.parquet: "{{ outputs.detect_premium.outputFiles['scored.parquet'] }}"
+    script: |
+      import pandas as pd
+      from openpyxl import Workbook
+      from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+      df = pd.read_parquet('scored.parquet')
+      ca = df[['product_id','post_title','price','total_sales','ca']].sort_values('ca', ascending=False)
+      wb = Workbook()
+      ws = wb.active
+      ws.title = "CA par produit"
+      hf = PatternFill("solid", fgColor="1A3C5E")
+      hfont = Font(bold=True, color="FFFFFF", name="Arial", size=11)
+      thin = Side(style="thin", color="CCCCCC")
+      brd = Border(left=thin, right=thin, top=thin, bottom=thin)
+      ws.merge_cells("A1:E1")
+      ws["A1"] = "Rapport CA — BottleNeck"
+      ws["A1"].font = Font(bold=True, name="Arial", size=13, color="1A3C5E")
+      ws["A1"].alignment = Alignment(horizontal="center")
+      for c, h in enumerate(['ID','Nom du vin','Prix (€)','Qté','CA (€)'], 1):
+          cell = ws.cell(row=3, column=c, value=h)
+          cell.font = hfont; cell.fill = hf
+          cell.alignment = Alignment(horizontal="center"); cell.border = brd
+      for r, (_, row) in enumerate(ca.iterrows(), 4):
+          for c, val in enumerate(row, 1):
+              cell = ws.cell(row=r, column=c, value=val)
+              cell.border = brd; cell.font = Font(name="Arial", size=10)
+              if c in (3,5): cell.number_format = '#,##0.00 €'
+      tr = len(ca) + 4
+      ws.cell(row=tr, column=1, value="TOTAL").font = Font(bold=True)
+      ws.cell(row=tr, column=5, value=float(df['ca'].sum())).number_format = '#,##0.00 €'
+      ws.column_dimensions['B'].width = 48
+      wb.save('/data/outputs/rapport_ca.xlsx')
+      print("✅ Export rapport_ca.xlsx OK")
+
+  - id: export_branches
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+
+      - id: export_premium
+        type: io.kestra.plugin.scripts.python.Script
+        runner: PROCESS
+        inputFiles:
+          scored.parquet: "{{ outputs.detect_premium.outputFiles['scored.parquet'] }}"
+        script: |
+          import pandas as pd
+          df = pd.read_parquet('scored.parquet')
+          prem = df[df['z_score'] > 2][['product_id','post_title','price','total_sales','ca','z_score']]
+          prem.columns = ['ID','Nom','Prix (€)','Qté','CA (€)','Z-score']
+          prem.sort_values('Z-score', ascending=False).to_csv(
+              '/data/outputs/vins_premium.csv', index=False, sep=';', decimal=',', encoding='utf-8-sig')
+          print(f"✅ Export vins_premium.csv — {len(prem)} lignes")
+
+      - id: export_ordinaires
+        type: io.kestra.plugin.scripts.python.Script
+        runner: PROCESS
+        inputFiles:
+          scored.parquet: "{{ outputs.detect_premium.outputFiles['scored.parquet'] }}"
+        script: |
+          import pandas as pd
+          df = pd.read_parquet('scored.parquet')
+          ordi = df[df['z_score'] <= 2][['product_id','post_title','price','total_sales','ca','z_score']]
+          ordi.columns = ['ID','Nom','Prix (€)','Qté','CA (€)','Z-score']
+          ordi.sort_values('Z-score', ascending=False).to_csv(
+              '/data/outputs/vins_ordinaires.csv', index=False, sep=';', decimal=',', encoding='utf-8-sig')
+          print(f"✅ Export vins_ordinaires.csv — {len(ordi)} lignes")
+
+errors:
+  - id: notify_on_error
+    type: io.kestra.plugin.core.log.Log
+    message: "❌ Erreur pipeline BottleNeck — vérifier les logs"
